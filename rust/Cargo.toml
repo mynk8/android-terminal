@@ -1,12 +1,21 @@
 [package]
 name = "gui-engine"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
 
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+
 [dependencies]
+vte = "0.15"
 gl = "0.14.0"
 glutin = "0.32.3"
 glutin-winit = "0.5.0"
@@ -17,5 +26,7 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 
 log = "0.4"
 android_logger = "0.13"
-nix = { version="0.31.1", features=["term", "process", "fs", "signal"] }
+nix = { version="0.31.1", features=["term", "process", "fs", "signal", "event"] }
+ndk = "0.9.0"
+zip = "0.6.6"
 bitflags = "2.10.0"

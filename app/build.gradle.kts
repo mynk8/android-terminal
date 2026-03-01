@@ -15,7 +15,6 @@ android {
 
         ndk {
             abiFilters += "arm64-v8a"
-            abiFilters += "armeabi-v7a"
         }
     }
 
@@ -28,11 +27,15 @@ android {
 
 dependencies { }
 
-tasks.whenTaskAdded {
-    if (name == "mergeDebugJniLibFolders") {
-        dependsOn(":buildRustDebug")
-    }
-    if (name == "mergeReleaseJniLibFolders") {
-        dependsOn(":buildRust")
-    }
+tasks.matching { it.name == "mergeDebugJniLibFolders" }.configureEach {
+    dependsOn(":buildRustDebug")
+}
+
+tasks.matching { it.name == "mergeReleaseJniLibFolders" }.configureEach {
+    dependsOn(":buildRust")
+}
+
+tasks.matching { it.name == "mergeDebugAssets" || it.name == "mergeReleaseAssets" }.configureEach {
+    dependsOn(":buildCustomBootstrap")
+    dependsOn(":buildTermuxExecCompat")
 }

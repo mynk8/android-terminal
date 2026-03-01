@@ -1,3 +1,5 @@
+mod bootstrap;
+mod config;
 mod core;
 
 use android_activity::AndroidApp;
@@ -14,17 +16,18 @@ use glutin::{
 use glutin_winit::DisplayBuilder;
 use raw_window_handle::HasWindowHandle;
 use skia_safe::{
-    ColorType, Surface,
     gpu::{
-        Protected, SurfaceOrigin, backend_render_targets, direct_contexts, gl::FramebufferInfo,
-        surfaces,
+        backend_render_targets, direct_contexts, gl::FramebufferInfo, surfaces, Protected,
+        SurfaceOrigin,
     },
+    ColorType, Surface,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{
     ffi::CString,
     num::NonZeroU32,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 use winit::{
@@ -35,16 +38,19 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::core::{Parser, Pty, Renderer, Term};
+use crate::bootstrap::setup_bootstrap_if_needed;
+use crate::config::{config_path, AppConfig};
+use crate::core::types::Term;
+use crate::core::{Parser, Pty, PtyEnv, Renderer};
 
 #[derive(Debug, Clone)]
 enum AppEvent {
     CursorBlink,
     PtyOutput(Vec<u8>),
+    PtyExit,
 }
 
 const CURSOR_BLINK_MS: u64 = 500;
-const PTY_POLL_MS: u64 = 10;
 const DEFAULT_SHELL: &str = "/system/bin/sh";
 
 #[unsafe(no_mangle)]
@@ -54,13 +60,47 @@ fn android_main(app: AndroidApp) {
     );
 
     use winit::platform::android::EventLoopBuilderExtAndroid;
+    let app_for_loop = app.clone();
     let event_loop: EventLoop<AppEvent> = EventLoop::with_user_event()
-        .with_android_app(app)
+        .with_android_app(app_for_loop)
         .build()
         .expect("Failed to create event loop");
 
     let proxy = event_loop.create_proxy();
     let mut application = App::new(proxy);
+    if let Some(base) = app.internal_data_path() {
+        let path = config_path(&base);
+        application.config = Some(AppConfig::load_or_create(&path));
+        log::info!("Loaded config: {:?}", path);
+
+        let assets = app.asset_manager();
+        match setup_bootstrap_if_needed(&base, &assets) {
+            Ok(paths) => {
+                let prefix = paths.prefix.to_string_lossy().to_string();
+                let mut env = PtyEnv::system_default();
+                env.term = "xterm-256color".to_string();
+                env.home = paths.home.clone();
+                env.cwd = Some(paths.home);
+                env.tmp = Some(paths.tmp);
+                env.prefix = Some(paths.prefix);
+                env.path = format!("{}/bin:/system/bin", prefix);
+                env.ld_library_path = Some(format!("{}/lib", prefix));
+                let termux_exec = format!("{}/lib/libtermux-exec.so", prefix);
+                if PathBuf::from(&termux_exec).is_file() {
+                    env.ld_preload = Some(termux_exec);
+                } else {
+                    log::warn!("libtermux-exec.so not found, using linker-only execution path");
+                }
+                log::info!("Bootstrapped prefix at {}", prefix);
+                application.pty_env = Some(env);
+            }
+            Err(e) => {
+                log::error!("Bootstrap setup failed: {:?}", e);
+            }
+        }
+    } else {
+        log::warn!("No internal data path available; using defaults");
+    }
 
     log::info!("Starting terminal emulator...");
     let _ = event_loop.run_app(&mut application);
@@ -71,6 +111,8 @@ struct App {
     event_proxy: EventLoopProxy<AppEvent>,
     threads_running: Arc<AtomicBool>,
     pty: Option<Arc<Pty>>,
+    config: Option<AppConfig>,
+    pty_env: Option<PtyEnv>,
 }
 
 impl App {
@@ -80,6 +122,8 @@ impl App {
             event_proxy: proxy,
             threads_running: Arc::new(AtomicBool::new(false)),
             pty: None,
+            config: None,
+            pty_env: None,
         }
     }
 
@@ -88,7 +132,26 @@ impl App {
             return;
         }
 
-        match Pty::spawn(DEFAULT_SHELL, rows, cols) {
+        let env = self.pty_env.clone().unwrap_or_else(PtyEnv::system_default);
+        let shell = env
+            .prefix
+            .as_ref()
+            .and_then(|p| {
+                let bash = p.join("bin/bash");
+                if bash.is_file() {
+                    return Some(bash);
+                }
+                let sh = p.join("bin/sh");
+                if sh.is_file() {
+                    return Some(sh);
+                }
+                None
+            })
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SHELL));
+        let shell = shell.to_string_lossy().to_string();
+        log::info!("Launching PTY shell: {}", shell);
+
+        match Pty::spawn(&shell, rows, cols, &env) {
             Ok(pty) => {
                 log::info!("PTY spawned successfully");
                 let pty = Arc::new(pty);
@@ -98,24 +161,90 @@ impl App {
                 let running = self.threads_running.clone();
                 let pty_reader = pty.clone();
                 std::thread::spawn(move || {
+                    use nix::sys::epoll::{
+                        epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent,
+                        EpollFlags, EpollOp,
+                    };
+
                     log::info!("PTY reader thread started");
+
+                    let epoll_fd = match epoll_create1(EpollCreateFlags::EPOLL_CLOEXEC) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            log::error!("Failed to create epoll: {:?}", e);
+                            return;
+                        }
+                    };
+
+                    let epoll_fd = epoll_fd;
+
+                    let mut event = EpollEvent::new(
+                        EpollFlags::EPOLLIN | EpollFlags::EPOLLET | EpollFlags::EPOLLERR,
+                        pty_reader.master_fd() as u64,
+                    );
+
+                    if let Err(e) = epoll_ctl(
+                        epoll_fd,
+                        EpollOp::EpollCtlAdd,
+                        pty_reader.master_fd(),
+                        &mut event,
+                    ) {
+                        log::error!("Failed to register epoll: {:?}", e);
+                        let _ = nix::unistd::close(epoll_fd);
+                        return;
+                    }
+
                     let mut buf = [0u8; 4096];
+                    let mut events = [EpollEvent::empty(); 8];
                     while running.load(Ordering::SeqCst) {
-                        match pty_reader.read(&mut buf) {
-                            Ok(0) => {
-                                std::thread::sleep(Duration::from_millis(PTY_POLL_MS));
-                            }
-                            Ok(n) => {
-                                let data = buf[..n].to_vec();
-                                let _ = proxy.send_event(AppEvent::PtyOutput(data));
-                            }
+                        let ready = match epoll_wait(epoll_fd, &mut events, -1) {
+                            Ok(n) => n,
                             Err(e) => {
-                                log::error!("PTY read error: {:?}", e);
+                                log::error!("Epoll wait error: {:?}", e);
+                                let _ = nix::unistd::close(epoll_fd);
                                 break;
+                            }
+                        };
+
+                        for _ in events.iter().take(ready) {
+                            loop {
+                                match pty_reader.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        let data = buf[..n].to_vec();
+                                        let _ = proxy.send_event(AppEvent::PtyOutput(data));
+                                    }
+                                    Err(e) => {
+                                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                                            break;
+                                        }
+                                        log::error!("PTY read error: {:?}", e);
+                                        let _ = nix::unistd::close(epoll_fd);
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
+                    let _ = nix::unistd::close(epoll_fd);
                     log::info!("PTY reader thread stopped");
+                });
+
+                // Exit only when the spawned shell process actually terminates.
+                let proxy = self.event_proxy.clone();
+                let child = pty.child_pid();
+                std::thread::spawn(move || {
+                    use nix::sys::wait::waitpid;
+
+                    match waitpid(child, None) {
+                        Ok(status) => {
+                            log::info!("PTY child {} exited: {:?}", child, status);
+                            let _ = proxy.send_event(AppEvent::PtyExit);
+                        }
+                        Err(e) => {
+                            log::warn!("waitpid({}) failed: {:?}", child, e);
+                        }
+                    }
                 });
             }
             Err(e) => {
@@ -154,6 +283,7 @@ struct AppState {
     term: Term,
     renderer: Renderer,
     parser: Parser,
+    config: AppConfig,
 
     cursor_visible: bool,
     last_input: Instant,
@@ -163,7 +293,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn init(event_loop: &ActiveEventLoop) -> Self {
+    fn init(event_loop: &ActiveEventLoop, config: AppConfig) -> Self {
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_depth_size(0)
@@ -240,11 +370,15 @@ impl AppState {
         )
         .expect("Failed to create Skia surface");
 
-        let renderer = Renderer::new();
-        let cols = (size.width as f32 / renderer.cell_w).floor() as usize;
-        let rows = (size.height as f32 / renderer.cell_h).floor() as usize;
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+        let renderer = Renderer::new(config.font_size, config.palette);
+        let cols = config
+            .grid_cols
+            .unwrap_or((size.width as f32 / renderer.cell_w).floor() as usize)
+            .max(1);
+        let rows = config
+            .grid_rows
+            .unwrap_or((size.height as f32 / renderer.cell_h).floor() as usize)
+            .max(1);
 
         log::info!("Terminal size: {}x{} cells", cols, rows);
 
@@ -261,6 +395,7 @@ impl AppState {
             term,
             renderer,
             parser,
+            config,
             cursor_visible: true,
             last_input: Instant::now(),
             ctrl_pressed: false,
@@ -296,10 +431,16 @@ impl AppState {
         )
         .unwrap();
 
-        let new_cols = (width as f32 / self.renderer.cell_w).floor() as usize;
-        let new_rows = (height as f32 / self.renderer.cell_h).floor() as usize;
-        let new_cols = new_cols.max(1);
-        let new_rows = new_rows.max(1);
+        let new_cols = self
+            .config
+            .grid_cols
+            .unwrap_or((width as f32 / self.renderer.cell_w).floor() as usize)
+            .max(1);
+        let new_rows = self
+            .config
+            .grid_rows
+            .unwrap_or((height as f32 / self.renderer.cell_h).floor() as usize)
+            .max(1);
 
         if new_cols != self.term.cols || new_rows != self.term.rows {
             log::info!(
@@ -480,7 +621,8 @@ impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("App resumed, initializing...");
         if self.state.is_none() {
-            self.state = Some(AppState::init(event_loop));
+            let config = self.config.clone().unwrap_or_else(AppConfig::default);
+            self.state = Some(AppState::init(event_loop, config));
         }
         if let Some(state) = &self.state {
             state.window.request_redraw();
@@ -551,17 +693,24 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
-        let Some(state) = &mut self.state else {
-            return;
-        };
-
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
+            AppEvent::PtyExit => {
+                log::info!("Shell exited, closing app");
+                self.stop_background_threads();
+                event_loop.exit();
+            }
             AppEvent::CursorBlink => {
+                let Some(state) = &mut self.state else {
+                    return;
+                };
                 state.toggle_cursor_blink();
                 state.window.request_redraw();
             }
             AppEvent::PtyOutput(data) => {
+                let Some(state) = &mut self.state else {
+                    return;
+                };
                 state.process_pty_output(&data);
                 state.window.request_redraw();
             }

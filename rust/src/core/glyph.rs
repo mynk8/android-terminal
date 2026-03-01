@@ -55,8 +55,8 @@ impl Default for Glyph {
     }
 }
 
-/// Base16 color palette
-pub const COLORS: [u32; 16] = [
+/// Base16 color palette (default)
+pub const DEFAULT_COLORS: [u32; 16] = [
     0x1e1e1e, // 0: black (bg)
     0xf44747, // 1: red
     0x608b4e, // 2: green
@@ -76,11 +76,42 @@ pub const COLORS: [u32; 16] = [
 ];
 
 #[inline]
-pub fn color_from_index(idx: u8) -> skia_safe::Color {
-    let rgb = COLORS[(idx & 0x0F) as usize];
+pub fn color_from_index(palette: &[u32; 16], idx: u8) -> skia_safe::Color {
+    let rgb = if idx < 16 {
+        palette[idx as usize]
+    } else {
+        xterm_256_rgb(idx)
+    };
     skia_safe::Color::from_rgb(
         ((rgb >> 16) & 0xFF) as u8,
         ((rgb >> 8) & 0xFF) as u8,
         (rgb & 0xFF) as u8,
     )
+}
+
+#[inline]
+fn xterm_256_rgb(idx: u8) -> u32 {
+    if (16..=231).contains(&idx) {
+        let i = idx - 16;
+        let r = i / 36;
+        let g = (i / 6) % 6;
+        let b = i % 6;
+        let rr = cube_component(r);
+        let gg = cube_component(g);
+        let bb = cube_component(b);
+        return ((rr as u32) << 16) | ((gg as u32) << 8) | (bb as u32);
+    }
+
+    // 232-255: grayscale ramp
+    let gray = 8u8.saturating_add((idx.saturating_sub(232)).saturating_mul(10));
+    ((gray as u32) << 16) | ((gray as u32) << 8) | (gray as u32)
+}
+
+#[inline]
+fn cube_component(v: u8) -> u8 {
+    if v == 0 {
+        0
+    } else {
+        55 + (40 * v)
+    }
 }

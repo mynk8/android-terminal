@@ -7,5 +7,6 @@ pub mod types;
 
 pub use parser::Parser;
 pub use pty::Pty;
+pub use pty::PtyEnv;
 pub use screen::Renderer;
 pub use types::Term;
